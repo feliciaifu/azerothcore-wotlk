@@ -58,37 +58,78 @@ using boost::asio::ip::tcp;
 using namespace boost::program_options;
 namespace fs = std::filesystem;
 
+/**
+ * @brief 初始化登录数据库连接池
+ * @return true 数据库加载并建立连接成功，false 失败
+ */
 bool StartDB();
+
+/**
+ * @brief 关闭登录数据库连接池并清理 MySQL 库资源
+ */
 void StopDB();
+
+/**
+ * @brief 操作系统信号句柄（用于响应 SIGINT/SIGTERM 实现优雅关机）
+ * @param ioContextRef IoContext 的弱引用指针
+ * @param error 系统错误码
+ * @param signalNumber 信号编号
+ */
 void SignalHandler(std::weak_ptr<Acore::Asio::IoContext> ioContextRef, boost::system::error_code const& error, int signalNumber);
+
+/**
+ * @brief 保持 MySQL 连接心跳的定时回调函数
+ * @param dbPingTimerRef 定时器弱引用
+ * @param dbPingInterval 心跳时间间隔（分钟）
+ * @param error 定时器错误码
+ */
 void KeepDatabaseAliveHandler(std::weak_ptr<boost::asio::steady_timer> dbPingTimerRef, int32 dbPingInterval, boost::system::error_code const& error);
+
+/**
+ * @brief 自动清理过期的 IP/账号封禁记录的定时回调函数
+ * @param banExpiryCheckTimerRef 定时器弱引用
+ * @param banExpiryCheckInterval 检测间隔时间（秒）
+ * @param error 定时器错误码
+ */
 void BanExpiryHandler(std::weak_ptr<boost::asio::steady_timer> banExpiryCheckTimerRef, int32 banExpiryCheckInterval, boost::system::error_code const& error);
+
+/**
+ * @brief 解析命令行启动参数
+ * @param argc 参数个数
+ * @param argv 参数字符串数组
+ * @param configFile 配置文件输出路径引用
+ * @return 解析得到的变量映射表 (variables_map)
+ */
 variables_map GetConsoleArguments(int argc, char** argv, fs::path& configFile);
 
-/// Launch the auth server
+/**
+ * @brief 认证服务器主程序入口点
+ */
 int main(int argc, char** argv)
 {
+    // 标记当前进程类型为 AuthServer
     Acore::Impl::CurrentServerProcessHolder::_type = SERVER_PROCESS_AUTHSERVER;
     signal(SIGABRT, &Acore::AbortHandler);
 
-    // Command line parsing
+    // 解析命令行参数并确定配置文件路径
     auto configFile = fs::path(sConfigMgr->GetConfigPath() + std::string(_ACORE_REALM_CONFIG));
     auto vm = GetConsoleArguments(argc, argv, configFile);
 
-    // exit if help or version is enabled
+    // 如果命令行包含 --help 或 --version，输出对应信息后退出
     if (vm.count("help") || vm.count("version"))
         return 0;
 
-    // Add file and args in config
+    // 加载和配置 App 配置文件 (authserver.conf)
     sConfigMgr->Configure(configFile.generic_string(), std::vector<std::string>(argv, argv + argc));
 
     if (!sConfigMgr->LoadAppConfigs())
         return 1;
 
-    // Init logging
+    // 初始化日志子系统并注册数据库日志追加器
     sLog->RegisterAppender<AppenderDB>();
     sLog->Initialize(nullptr);
 
+    // 显示开机 Banner 横幅及软件版本信息
     Acore::Banner::Show("authserver",
         [](std::string_view text)
         {
@@ -101,16 +142,18 @@ int main(int argc, char** argv)
             LOG_INFO("server.authserver", "> Using Boost version:           {}.{}.{}", BOOST_VERSION / 100000, BOOST_VERSION / 100 % 1000, BOOST_VERSION % 100);
         });
 
+    // 初始化 OpenSSL 多线程环境
     OpenSSLCrypto::threadsSetup();
 
+    // 使用 RAII 共享指针在 main() 退出时自动清理 OpenSSL 资源
     std::shared_ptr<void> opensslHandle(nullptr, [](void*) { OpenSSLCrypto::threadsCleanup(); });
 
-    // authserver PID file creation
+    // 创建 PID 进程号文件
     std::string pidFile = sConfigMgr->GetOption<std::string>("PidFile", "");
     if (!pidFile.empty())
     {
         if (uint32 pid = CreatePIDFile(pidFile))
-            LOG_INFO("server.authserver", "Daemon PID: {}\n", pid); // outError for red color in console
+            LOG_INFO("server.authserver", "Daemon PID: {}\n", pid); // 成功创建 PID 文件
         else
         {
             LOG_ERROR("server.authserver", "Cannot create PID file {} (possible error: permission)\n", pidFile);
@@ -118,24 +161,25 @@ int main(int argc, char** argv)
         }
     }
 
-    // Initialize the database connection
+    // 初始化数据库连接
     if (!StartDB())
         return 1;
 
     sSecretMgr->Initialize();
 
-    // Load IP Location Database
+    // 加载 IP 地理位置数据库
     sIPLocation->Load();
 
+    // 使用 RAII 保证退出时安全关闭数据库连接池
     std::shared_ptr<void> dbHandle(nullptr, [](void*) { StopDB(); });
 
-    // Mark every realm offline on startup; each worldserver clears this flag for its own realm once it is ready.
-    // This prevents realms from appearing online in the realm list when no worldserver is actually running.
+    // 开机时将所有 Realm 服务器默认标记为 Offline 状态
+    // 后续每个具体的 worldserver 节点启动成功后会自行清除离线标志位
     LoginDatabase.DirectExecute("UPDATE realmlist SET flag = flag | {}", REALM_FLAG_OFFLINE);
 
     std::shared_ptr<Acore::Asio::IoContext> ioContext = std::make_shared<Acore::Asio::IoContext>();
 
-    // Get the list of realms for the server
+    // 初始化 Realm 列表管理器
     sRealmList->Initialize(*ioContext, sConfigMgr->GetOption<int32>("RealmsStateUpdateDelay", 20));
 
     std::shared_ptr<void> sRealmListHandle(nullptr, [](void*) { sRealmList->Close(); });
@@ -146,14 +190,14 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // Stop auth server if dry run
+    // 若配置为 dry-run 演练模式，初始化检查完成后直接正常退出
     if (sConfigMgr->isDryRun())
     {
         LOG_INFO("server.authserver", "Dry run completed, terminating.");
         return 0;
     }
 
-    // Start the listening port (acceptor) for auth connections
+    // 启动登录连接监听端口 (默认端口 3724)
     int32 port = sConfigMgr->GetOption<int32>("RealmServerPort", 3724);
     if (port < 0 || port > 0xFFFF)
     {
@@ -171,32 +215,34 @@ int main(int argc, char** argv)
 
     std::shared_ptr<void> sAuthSocketMgrHandle(nullptr, [](void*) { sAuthSocketMgr.StopNetwork(); });
 
-    // Set signal handlers
+    // 注册操作系统信号处理程序 (SIGINT, SIGTERM)
     boost::asio::signal_set signals(*ioContext, SIGINT, SIGTERM);
 #if AC_PLATFORM == AC_PLATFORM_WINDOWS
     signals.add(SIGBREAK);
 #endif
     signals.async_wait(std::bind(&SignalHandler, std::weak_ptr<Acore::Asio::IoContext>(ioContext), std::placeholders::_1, std::placeholders::_2));
 
-    // Set process priority according to configuration settings
+    // 根据配置设置进程优先级与 CPU 亲和性
     SetProcessPriority("server.authserver", sConfigMgr->GetOption<int32>(CONFIG_PROCESSOR_AFFINITY, 0), sConfigMgr->GetOption<bool>(CONFIG_HIGH_PRIORITY, false));
 
-    // Enabled a timed callback for handling the database keep alive ping
+    // 创建并设置数据库心跳定时器
     int32 dbPingInterval = sConfigMgr->GetOption<int32>("MaxPingTime", 30);
     std::shared_ptr<boost::asio::steady_timer> dbPingTimer = std::make_shared<boost::asio::steady_timer>(*ioContext);
 
     dbPingTimer->expires_at(Acore::Asio::SteadyTimer::GetExpirationTime(dbPingInterval * MINUTE));
     dbPingTimer->async_wait(std::bind(&KeepDatabaseAliveHandler, std::weak_ptr<boost::asio::steady_timer>(dbPingTimer), dbPingInterval, std::placeholders::_1));
 
+    // 创建并设置封禁过期检查定时器
     int32 banExpiryCheckInterval = sConfigMgr->GetOption<int32>("BanExpiryCheckInterval", 60);
     std::shared_ptr<boost::asio::steady_timer> banExpiryCheckTimer = std::make_shared<boost::asio::steady_timer>(*ioContext);
 
     banExpiryCheckTimer->expires_at(Acore::Asio::SteadyTimer::GetExpirationTime(banExpiryCheckInterval));
     banExpiryCheckTimer->async_wait(std::bind(&BanExpiryHandler, std::weak_ptr<boost::asio::steady_timer>(banExpiryCheckTimer), banExpiryCheckInterval, std::placeholders::_1));
 
-    // Start the io service worker loop
+    // 阻塞运行 Boost.Asio 事件驱动循环
     ioContext->run();
 
+    // 清理定时器与信号处理程序并退出
     banExpiryCheckTimer->cancel();
     dbPingTimer->cancel();
 
@@ -207,14 +253,14 @@ int main(int argc, char** argv)
     return 0;
 }
 
-/// Initialize connection to the database
+/**
+ * @brief 初始化登录数据库连接池
+ */
 bool StartDB()
 {
     MySQL::Library_Init();
 
-    // Load databases
-    // NOTE: While authserver is singlethreaded you should keep synch_threads == 1.
-    // Increasing it is just silly since only 1 will be used ever.
+    // authserver 属于单线程工作，同步线程池大小设为 1
     DatabaseLoader loader("server.authserver");
     loader
         .AddDatabase(LoginDatabase, "Login");
@@ -223,17 +269,22 @@ bool StartDB()
         return false;
 
     LOG_INFO("server.authserver", "Started auth database connection pool.");
-    sLog->SetRealmId(0); // Enables DB appenders when realm is set.
+    sLog->SetRealmId(0); // 设置全局 RealmId = 0 以启用数据库日志追加器
     return true;
 }
 
-/// Close the connection to the database
+/**
+ * @brief 关闭登录数据库连接并释放资源
+ */
 void StopDB()
 {
     LoginDatabase.Close();
     MySQL::Library_End();
 }
 
+/**
+ * @brief 系统信号句柄逻辑，停止 IoContext 事件循环
+ */
 void SignalHandler(std::weak_ptr<Acore::Asio::IoContext> ioContextRef, boost::system::error_code const& error, int /*signalNumber*/)
 {
     if (!error)
@@ -245,6 +296,9 @@ void SignalHandler(std::weak_ptr<Acore::Asio::IoContext> ioContextRef, boost::sy
     }
 }
 
+/**
+ * @brief 数据库 KeepAlive 定时器回调
+ */
 void KeepDatabaseAliveHandler(std::weak_ptr<boost::asio::steady_timer> dbPingTimerRef, int32 dbPingInterval, boost::system::error_code const& error)
 {
     if (!error)
@@ -260,6 +314,9 @@ void KeepDatabaseAliveHandler(std::weak_ptr<boost::asio::steady_timer> dbPingTim
     }
 }
 
+/**
+ * @brief 封禁过期检查定时器回调（清理 acore_auth 中过期的 IP 和账号 Ban 纪录）
+ */
 void BanExpiryHandler(std::weak_ptr<boost::asio::steady_timer> banExpiryCheckTimerRef, int32 banExpiryCheckInterval, boost::system::error_code const& error)
 {
     if (!error)
@@ -275,6 +332,9 @@ void BanExpiryHandler(std::weak_ptr<boost::asio::steady_timer> banExpiryCheckTim
     }
 }
 
+/**
+ * @brief 解析命令行控制台输入参数
+ */
 variables_map GetConsoleArguments(int argc, char** argv, fs::path& configFile)
 {
     options_description all("Allowed options");
